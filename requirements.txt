@@ -1,0 +1,6 @@
+# Pinned environment used for all manuscript results (Linux x86-64, CPU torch)
+matplotlib==3.11.1
+numpy==2.5.1
+pandas==3.0.5
+scipy==1.18.0
+torch==2.13.0

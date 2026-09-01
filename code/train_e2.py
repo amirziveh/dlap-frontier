@@ -1,0 +1,665 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+train_e2.py — DLAP-TSE Phase 3/4: E2–E8 deep SDF training & evaluation
+=======================================================================
+Rolling-window protocol (train 48 / valid 12 / test 12, 60-month lookback,
+common period 2008-07..2026-06) — identical to E1 so results are comparable.
+
+ARCHITECTURES:
+  --arch cpz (DEFAULT, faithful to Chen, Pelger & Zhu 2024):
+      omega_t(i) = SDFNet(z_t, x_{i,t})               (dense over concat(x,z), [64,64], out=1)
+      M_t        = 1 - (1/N_t) * sum_i omega_t(i) * R^e_{t,i} * mean(N_t)   (COMMON SDF)
+      alpha_i    = (1/T_i) * sum_t M_t * R^e_{t,i}    (common M)
+      loss       = mean_i (count_i / max_count) * alpha_i^2   (official weighted loss)
+      critic (E5): MomentsNet(z_t, x_{i,t}) -> m_t(i) in R^8 (tanh); critic maximizes
+                   mean_{k,i} [mean_t m_{k,t,i} M_t R^e_{t,i}]^2, SDF minimizes it
+                   (alternating Adam, loss_factor 1.0)
+      SDF portfolio: r_p,t = sum_i omega_t(i) R^e_{t,i} / sum_i |omega_t(i)|  (unit gross lev.)
+  --arch charscore (LEGACY per-stock linear characteristic SDF — kept ONLY as a
+      robustness specification, labeled "characteristic-score SDF" in the paper):
+      M_{i,t} = 1 - w(z_t)' x_{i,t};  alpha_i = mean_t M_{i,t} R^e_{i,t};
+      runs write to results/charscore/.
+
+Experiments (naming unchanged):
+  E2  --charset sy   --states lstm            (11 SY signals, macro states)
+  E3  --charset all  --states lstm            (20 chars, macro states)
+  E4a --charset all  --states const           (20 chars, NO macro conditioning)
+  E4b --charset sy   --states const           (11 chars, NO macro conditioning)
+  E5a --charset sy   --states lstm --critic   (adversarial critic ON)
+  E5b --charset all  --states lstm --critic
+  E8  --charset sy   --states lstm --liq-filter
+  E8b --charset all  --states lstm --liq-filter
+
+Outputs: results/{e2,e3,e4a,e4b,e5a,e5b,e8,e8b}_results.csv + _pooled_series.csv
+"""
+import argparse
+import csv
+import os
+import math
+import sys
+from pathlib import Path
+
+import numpy as np
+import torch
+
+sys.path.insert(0, str(Path(__file__).parent))
+from eval_core import load_npz, load_rf, load_factors_ff5, load_factors_q, \
+    sharpe_ann, rolling_windows, lag_align
+from sdf_models import (ZNet, ConstZNet, MNet, CriticNet, SDFNet, MomentsNet,
+                        sdf_values, pricing_errors, common_sdf,
+                        pricing_errors_common, weighted_pricing_loss,
+                        sdf_portfolio_return, critic_moment_alphas,
+                        critic_alpha)
+
+ROOT = Path(os.environ.get("DLAP_ROOT", str(Path.home() / "research/dlap-tse")))
+_COUNTRY = os.environ.get("DLAP_COUNTRY", "").upper()
+if _COUNTRY == "TR":
+    DATA = ROOT / "data_tr"
+    RES = ROOT / "results_tr"
+elif _COUNTRY == "PK":
+    DATA = ROOT / "data_pk"
+    RES = ROOT / "results_pk"
+else:
+    DATA = ROOT / "data"
+    RES = ROOT / "results"
+RES.mkdir(exist_ok=True)
+
+torch.manual_seed(42)
+
+SY_INDICES = [5, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]  # legacy (IR); use charset_indices()
+SY_NAMES = ["mom", "ag", "ac", "noa", "nsi", "gp", "cei", "ita", "ig",
+            "dist", "oscore"]
+
+
+def charset_indices(variables):
+    """Country-aware char indices for the sy set, from actual variable names.
+    variables = npz variable list (first entry 'return').
+    sy = canonical fama-five signals ∩ available (IR: 11 incl. ig; PK: 10)."""
+    v = list(variables)
+    sy_idx = [v.index(n) - 1 for n in SY_NAMES if n in v]
+    return sy_idx
+
+
+STATE_DIM = 4
+LR = 1e-3
+MAX_EPOCHS = 400
+PATIENCE = 25
+MIN_OBS_ALPHA = 6
+LOSS_FACTOR = 1.0  # critic term weight in the SDF loss (official loss_factor)
+N_MOMENTS = 8      # official num_condition_moment
+
+
+def load_data():
+    arr, dates, variables, tickers = load_npz()
+    rf = load_rf()
+    ff5 = load_factors_ff5()
+    q = load_factors_q()
+    common = [d for d in dates if (int(d[:4]), int(d[5:7])) in ff5 and
+              (int(d[:4]), int(d[5:7])) in q]
+    pos = {d: i for i, d in enumerate(dates)}
+    idx = [pos[d] for d in common]
+    R = arr[idx, :, 0].astype(float)
+    R[R < -50] = np.nan
+    rf_v = np.array([rf.get(d, np.nan) for d in common])
+    R_exc = R - rf_v[:, None]
+    X = arr[idx, :, 1:].astype(float)
+    X[X < -50] = np.nan
+    M = np.load(DATA / "Macro_all.npz", allow_pickle=True)
+    macro = M["data"].astype(float)[idx, :]
+    for s in range(macro.shape[1]):
+        col = macro[:, s]
+        prev = None
+        for t in range(len(col)):
+            if math.isfinite(col[t]):
+                prev = col[t]
+            else:
+                col[t] = prev if prev is not None else 0.0
+
+    # ── proper alignment: x_{t-1} and z_{t-1} price r_t (CPZ convention) ──
+    X, macro = lag_align(X, macro)
+
+    return R_exc, X, macro, common
+
+
+def make_tensors(R, X, core_idx):
+    """mask = return present AND all core characteristics present.
+    core_idx = the well-covered signal set (sy-11); for the 'all' charset the
+    auxiliary chars are soft features (zero-filled when missing)."""
+    mask = np.isfinite(R) & np.isfinite(X[:, :, core_idx]).all(axis=2)
+    return (torch.from_numpy(np.nan_to_num(R, nan=0.0)).float(),
+            torch.from_numpy(np.nan_to_num(X, nan=0.0)).float(),
+            torch.from_numpy(mask))
+
+
+def train_window(R_tr, X_tr, macro_tr, R_va, X_va, macro_va, n_features,
+                 states="lstm", critic=False, arch="cpz", hidden=(64, 64),
+                 core_idx=None, pin_lambda=0.0):
+    R_tr_t, X_tr_t, mask_tr = make_tensors(R_tr, X_tr, core_idx)
+    R_va_t, X_va_t, mask_va = make_tensors(R_va, X_va, core_idx)
+    if os.environ.get("DLAP_DEBUG_MASK"):
+        print(f"  [dbg] train mask cells={int(mask_tr.sum())} "
+              f"months={int((mask_tr.sum(axis=1) > 0).sum())}/{mask_tr.shape[0]} "
+              f"val cells={int(mask_va.sum())}")
+    mu = macro_tr.mean(axis=0)
+    sd = macro_tr.std(axis=0) + 1e-12
+    mac_tr = torch.from_numpy((macro_tr - mu) / sd).float()
+    mac_va = torch.from_numpy((macro_va - mu) / sd).float()
+
+    znet = ZNet(macro_dim=macro_tr.shape[1], state_dim=STATE_DIM) if states == "lstm" \
+        else ConstZNet(STATE_DIM)
+    if arch == "cpz":
+        sdfnet = SDFNet(state_dim=STATE_DIM, n_features=n_features, hidden=hidden)
+    else:  # charscore (legacy per-stock linear)
+        sdfnet = MNet(state_dim=STATE_DIM, n_features=n_features)
+    opt_s = torch.optim.Adam(list(znet.parameters()) + list(sdfnet.parameters()), lr=LR)
+    cnet = None
+    opt_c = None
+    if critic:
+        if arch == "cpz":
+            cnet = MomentsNet(state_dim=STATE_DIM, n_features=n_features,
+                              n_moments=N_MOMENTS)
+        else:
+            cnet = CriticNet(STATE_DIM, n_features)
+        opt_c = torch.optim.Adam(cnet.parameters(), lr=LR)
+
+    def sdf_loss(z, X, R, mask, use_critic=True, pin=False):
+        if arch == "cpz":
+            omega = sdfnet(z, X)
+            M = common_sdf(omega, R, mask)
+            alpha = pricing_errors_common(M, R, mask)
+            loss = weighted_pricing_loss(alpha, mask)
+            if pin and pin_lambda > 0:
+                # Method B (ex-ante sign identification): penalize a NEGATIVE
+                # mean TRAIN-window SDF-portfolio return, pinning the
+                # portfolio's orientation using training data only (no test
+                # leakage). Validation/early stopping stay on the pure
+                # pricing loss.
+                rp_tr = sdf_portfolio_return(omega, R, mask)
+                fin = rp_tr[torch.isfinite(rp_tr)]
+                if fin.numel() > 0:
+                    loss = loss + pin_lambda * torch.relu(-fin.mean()) ** 2
+        else:
+            M = sdf_values(sdfnet(z), X)
+            alpha = pricing_errors(M, R, mask)
+            loss = torch.nanmean(alpha ** 2)
+        if use_critic and cnet is not None:
+            with torch.no_grad():
+                if arch == "cpz":
+                    m = cnet(z, X)
+                else:
+                    m = cnet(z)
+            if arch == "cpz":
+                ak = critic_moment_alphas(M, m, R, mask)
+                loss = loss + LOSS_FACTOR * torch.nanmean(ak ** 2)
+            else:
+                loss = loss + LOSS_FACTOR * critic_alpha(M, m, X, R, mask) ** 2
+        return loss, M
+
+    best_val = float("inf")
+    best_state = None
+    patience = 0
+    epochs_used = 0
+    for epoch in range(MAX_EPOCHS):
+        # --- critic step (maximize its portfolios' squared pricing errors) ---
+        if cnet is not None:
+            cnet.train()
+            z_tr = znet(mac_tr)
+            with torch.no_grad():
+                if arch == "cpz":
+                    M_tr = common_sdf(sdfnet(z_tr, X_tr_t), R_tr_t, mask_tr)
+                else:
+                    M_tr = sdf_values(sdfnet(z_tr), X_tr_t)
+            if arch == "cpz":
+                m = cnet(z_tr.detach(), X_tr_t)
+                ak = critic_moment_alphas(M_tr, m, R_tr_t, mask_tr)
+                loss_c = -torch.nanmean(ak ** 2)
+            else:
+                wc = cnet(z_tr.detach())
+                alpha_c = critic_alpha(M_tr, wc, X_tr_t, R_tr_t, mask_tr)
+                loss_c = -(alpha_c ** 2)
+            opt_c.zero_grad()
+            loss_c.backward()
+            opt_c.step()
+
+        # --- SDF step (minimize pricing errors incl. critic portfolios) ---
+        znet.train(); sdfnet.train()
+        z_tr = znet(mac_tr)
+        loss, _ = sdf_loss(z_tr, X_tr_t, R_tr_t, mask_tr, use_critic=critic,
+                           pin=True)
+        opt_s.zero_grad()
+        loss.backward()
+        opt_s.step()
+        epochs_used = epoch + 1
+
+        # --- validation ---
+        znet.eval(); sdfnet.eval()
+        if cnet is not None:
+            cnet.eval()
+        with torch.no_grad():
+            z_va = znet(mac_va)
+            val_loss, _ = sdf_loss(z_va, X_va_t, R_va_t, mask_va, use_critic=critic)
+            val_loss = val_loss.item()
+        if val_loss < best_val:
+            best_val = val_loss
+            best_state = ({k: v.clone() for k, v in znet.state_dict().items()},
+                          {k: v.clone() for k, v in sdfnet.state_dict().items()},
+                          {k: v.clone() for k, v in cnet.state_dict().items()}
+                          if cnet is not None else None)
+            patience = 0
+        else:
+            patience += 1
+            if patience >= PATIENCE:
+                break
+
+    if best_state is None:
+        raise RuntimeError("training failed")
+    znet.load_state_dict(best_state[0])
+    sdfnet.load_state_dict(best_state[1])
+    if cnet is not None:
+        cnet.load_state_dict(best_state[2])
+    # diagnostic: mean train-window SDF-portfolio return under the BEST nets
+    # (Method B evidence that the pin actually binds: should be >= 0)
+    tr_rp_mean = math.nan
+    if arch == "cpz" and pin_lambda > 0:
+        with torch.no_grad():
+            z_b = znet(mac_tr)
+            rp_b = sdf_portfolio_return(sdfnet(z_b, X_tr_t), R_tr_t, mask_tr)
+            fin = rp_b[torch.isfinite(rp_b)]
+            if fin.numel() > 0:
+                tr_rp_mean = float(fin.mean())
+    # strict predictive OOS R2 inputs (revision P6, 2026-08-31): frozen
+    # train-window quantities applied unchanged to the test months —
+    # betas from a TRAIN OLS of each stock's excess return on the TRAIN
+    # SDF-portfolio return, lambda = TRAIN portfolio mean. Symmetric with
+    # the E1 benchmarks' construction (run_e1.eval_factor_model).
+    oos_r2_inputs = None
+    if arch == "cpz":
+        with torch.no_grad():
+            z_b = znet(mac_tr)
+            rp_tr = sdf_portfolio_return(sdfnet(z_b, X_tr_t), R_tr_t, mask_tr)
+        rp_np = rp_tr.numpy()
+        fin_t = np.isfinite(rp_np)
+        betas, lam = [], math.nan
+        if fin_t.sum() >= 12:
+            lam = float(np.nanmean(rp_np[fin_t]))
+            for i in range(R_tr.shape[1]):
+                ri = R_tr[:, i]
+                m = fin_t & np.isfinite(ri)
+                if m.sum() < 12 or np.var(rp_np[m]) < 1e-12:
+                    continue
+                b = np.polyfit(rp_np[m], ri[m], 1)
+                betas.append((i, float(b[0])))
+        if betas and math.isfinite(lam):
+            oos_r2_inputs = (betas, lam)
+    return znet, sdfnet, cnet, best_val, epochs_used, tr_rp_mean, oos_r2_inputs
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--charset", choices=["sy", "all"], default="sy")
+    ap.add_argument("--states", choices=["lstm", "const"], default="lstm")
+    ap.add_argument("--critic", action="store_true")
+    ap.add_argument("--arch", choices=["cpz", "charscore"], default="cpz",
+                    help="cpz: faithful common SDF (default); charscore: legacy per-stock")
+    ap.add_argument("--seed", type=int, default=42,
+                    help="torch seed (multi-seed robustness checks; results go to "
+                         "results/seed<seed>/ for seed != 42)")
+    ap.add_argument("--liq-filter", action="store_true",
+                    help="E8: drop stocks in the bottom 5% of mean train-window turnover")
+    ap.add_argument("--dump-mechanism", action="store_true",
+                    help="E8-mechanism analysis: save per-window tickers, omega_te, "
+                         "per-stock pricing errors, R_te and train-window turnover to "
+                         "results/mechanism_dump/ (results CSVs also go there, so master "
+                         "results are never clobbered)")
+    ap.add_argument("--width", type=int, default=64,
+                    help="hidden width of the SDF weight network (arch sensitivity)")
+    ap.add_argument("--depth", type=int, default=2,
+                    help="hidden depth of the SDF weight network (arch sensitivity)")
+    ap.add_argument("--drop-random", action="store_true",
+                    help="Placebo A: drop the same NUMBER of stocks as the E8 "
+                         "liquidity filter, but chosen at random per window")
+    ap.add_argument("--drop-noisy", action="store_true",
+                    help="Placebo B: drop the same NUMBER of stocks as the E8 "
+                         "liquidity filter, chosen as the highest train-window "
+                         "return-volatility (noise proxy) stocks")
+    ap.add_argument("--pin-lambda", type=float, default=0.0,
+                    help="Method B (ex-ante sign identification): add "
+                         "lambda * relu(-mean_train(SDF portfolio return))^2 to the "
+                         "training loss, pinning the portfolio's orientation using "
+                         "TRAINING data only. 0.0 = off (default, faithful CPZ)")
+    args = ap.parse_args()
+    torch.manual_seed(args.seed)
+
+    if args.drop_random or args.drop_noisy:  # placebo runs
+        out_name = "prandom" if args.drop_random else "pnoisy"
+    elif args.liq_filter:
+        out_name = "e8" if args.charset == "sy" else "e8b"
+    elif args.critic:
+        out_name = "e5a" if args.charset == "sy" else "e5b"
+    elif args.states == "const":
+        out_name = "e4b" if args.charset == "sy" else "e4a"
+    elif args.drop_random:
+        out_name = "prandom"
+    elif args.drop_noisy:
+        out_name = "pnoisy"
+    else:
+        out_name = "e2" if args.charset == "sy" else "e3"
+
+    if args.pin_lambda > 0:
+        out_name = f"{out_name}pin{args.pin_lambda:g}"
+
+    out_dir = RES / ("charscore" if args.arch == "charscore" else ".")
+    if args.seed != 42:
+        out_dir = RES / f"seed{args.seed}" / ("charscore" if args.arch == "charscore" else ".")
+    if args.dump_mechanism:
+        out_dir = RES / "mechanism_dump"
+    if args.width != 64 or args.depth != 2:  # architecture sensitivity runs
+        out_dir = RES / "archsens" / f"w{args.width}_d{args.depth}" / \
+            (f"seed{args.seed}" if args.seed != 42 else ".")
+    if args.drop_random or args.drop_noisy:  # placebo runs
+        out_dir = RES / "placebo" / out_name / \
+            (f"seed{args.seed}" if args.seed != 42 else ".")
+    out_dir.mkdir(exist_ok=True, parents=True)
+
+    R_exc, X, macro, common = load_data()
+    _, _, variables_all, tickers_all = load_npz()
+    X_full = X  # keep full char array for the liquidity filter
+    # country-aware signal indices (see charset_indices): sy identical across
+    # markets; 'all' = every available characteristic (PK has 19: ig dropped);
+    # auxiliary chars beyond the sy core are soft features (zero-filled)
+    sy_idx = charset_indices(variables_all)
+    core_idx = sy_idx
+    feat_idx = sy_idx if args.charset == "sy" else list(range(X.shape[2]))
+    core_pos = [feat_idx.index(i) for i in core_idx]  # positions in sliced space
+    n_features = len(feat_idx)
+    print(f"== {out_name.upper()} [{args.arch}]: {n_features} chars, states="
+          f"{args.states}, critic={args.critic} ==")
+    T = len(common)
+    windows = list(rolling_windows(list(range(T)), train=60, test=12))
+    print(f"  {len(windows)} windows, period {common[0]}..{common[-1]}")
+
+    X = np.clip(X[:, :, feat_idx], -10.0, 10.0)
+    turnover_full = X_full[:, :, 2]  # turnover = char index 2 (full space)
+
+    pooled_rp, all_alphas, per_win_sharpe = [], [], []
+    alpha_cells = []  # (oos_window_idx, alpha) rows for the RMS window bootstrap
+    oos_r2_num = oos_r2_den = 0.0  # strict predictive OOS R2 accumulators (P6)
+    critic_alphas = []
+    done_windows = []  # indices of windows that contributed to pooled_rp
+    sign_rows = []  # (window, L(+omega), L(-omega), relative gap) — sign-symmetry diagnostic
+    n_windows = 0
+    for wi, (w_tr, w_te) in enumerate(windows):
+        w_va = w_tr[-12:]
+        w_tr = w_tr[:-12]
+        R_tr, X_tr, mac_tr = R_exc[w_tr], X[w_tr], macro[w_tr]
+        R_va, X_va, mac_va = R_exc[w_va], X[w_va], macro[w_va]
+        R_te, X_te, mac_te = R_exc[w_te], X[w_te], macro[w_te]
+
+        keep = np.isfinite(R_tr).sum(axis=0) >= 12
+        if args.liq_filter:
+            tr_turn = np.nanmean(turnover_full[w_tr][:, keep], axis=0)
+            thr = np.nanpercentile(tr_turn, 5)
+            keep = keep.copy()
+            keep[keep] = keep[keep] & (tr_turn > thr)
+        elif args.drop_random or args.drop_noisy:
+            # placebo: drop the same COUNT as the E8 liquidity filter
+            tr_turn = np.nanmean(turnover_full[w_tr][:, keep], axis=0)
+            n_drop = int(np.sum(tr_turn <= np.nanpercentile(tr_turn, 5)))
+            if args.drop_random:
+                rng = np.random.default_rng(1000 * args.seed + wi)
+                drop = rng.choice(np.where(keep)[0], size=n_drop, replace=False)
+            else:  # drop_noisy: highest train-window return volatility
+                vol_tr = np.nanmean(X_full[w_tr][:, :, 3][:, keep], axis=0)
+                drop = np.where(keep)[0][np.argsort(vol_tr)[-n_drop:]]
+            keep = keep.copy()
+            keep[drop] = False
+        R_tr, X_tr = R_tr[:, keep], X_tr[:, keep]
+        R_va, X_va = R_va[:, keep], X_va[:, keep]
+        R_te, X_te = R_te[:, keep], X_te[:, keep]
+        if R_tr.shape[1] < 50:
+            print(f"  window {wi}: skipped ({R_tr.shape[1]} stocks)")
+            continue
+        # guard: a window whose estimation mask has NO coverage cannot be
+        # trained (loss undefined, no gradient) — its OOS months would inherit
+        # an untrained network. Skip and disclose (PK window 0: noa missing
+        # before 2018-10 under the all-core-char mask).
+        if args.arch == "cpz":
+            mask_chk = np.isfinite(R_tr) & np.isfinite(X_tr[:, :, core_pos]).all(axis=2)
+            if not mask_chk.any():
+                # Disclosed skip (PK window 0: nsi missing before 2018-10 under
+                # the all-core-char estimation mask — untrainable, would inject
+                # an untrained network's OOS months into the pooled results).
+                print(f"  window {wi}: skipped (no core-character coverage)")
+                continue
+
+        znet, sdfnet, cnet, val_loss, epochs_used, tr_rp_mean, oos_r2_inputs = train_window(
+            R_tr, X_tr, mac_tr, R_va, X_va, mac_va, n_features,
+            states=args.states, critic=args.critic, arch=args.arch,
+            hidden=tuple([args.width] * args.depth), core_idx=core_pos,
+            pin_lambda=args.pin_lambda)
+        print(f"  window {wi} [{common[w_te[0]]}..{common[w_te[-1]]}]: "
+              f"val_loss={val_loss:.2e} epochs={epochs_used}"
+              + (f" train_rp_mean={tr_rp_mean:+.4f}" if math.isfinite(tr_rp_mean) else ""))
+
+        # ── sign-symmetry diagnostic (training window, trained nets): ──
+        # flipping omega -> -omega negates the covariance component of each
+        # pricing error but leaves the mean component; report the training
+        # loss at both orientations. Near-equality = approximate sign
+        # symmetry of the finite-sample objective (direct evidence).
+        if args.arch == "cpz":
+            with torch.no_grad():
+                znet.eval(); sdfnet.eval()  # deterministic diagnostic (no dropout)
+                R_tr_d, X_tr_d, mask_tr_d = make_tensors(R_tr, X_tr, core_pos)
+                mu_d = mac_tr.mean(axis=0)
+                sd_d = mac_tr.std(axis=0) + 1e-12
+                z_tr_d = znet(torch.from_numpy((mac_tr - mu_d) / sd_d).float())
+                om_tr = sdfnet(z_tr_d, X_tr_d)
+                M_p = common_sdf(om_tr, R_tr_d, mask_tr_d)
+                M_m = common_sdf(-om_tr, R_tr_d, mask_tr_d)
+                a_p = pricing_errors_common(M_p, R_tr_d, mask_tr_d)
+                a_m = pricing_errors_common(M_m, R_tr_d, mask_tr_d)
+                L_p = weighted_pricing_loss(a_p, mask_tr_d).item()
+                L_m = weighted_pricing_loss(a_m, mask_tr_d).item()
+                if not (math.isfinite(L_p) and math.isfinite(L_m)):
+                    cnt_d = mask_tr_d.sum(dim=0)
+                    print(f"  [symdiag] window {wi}: non-finite loss "
+                          f"(omega finite: {bool(torch.isfinite(om_tr).all())}, "
+                          f"M+ finite: {bool(torch.isfinite(M_p).all())}, "
+                          f"alpha+ finite: {int(torch.isfinite(a_p).sum())}/{a_p.numel()}, "
+                          f"mask stocks>=6mo: {int((cnt_d >= 6).sum())}, "
+                          f"mask max cnt: {int(cnt_d.max())}, "
+                          f"months covered: {int((mask_tr_d.sum(dim=1) > 0).sum())}/{mask_tr_d.shape[0]})")
+            sign_rows.append((wi, L_p, L_m,
+                              abs(L_p - L_m) / min(L_p, L_m)
+                              if min(L_p, L_m) > 0 else math.nan))
+
+        znet.eval(); sdfnet.eval()
+        if cnet is not None:
+            cnet.eval()
+        mu = mac_tr.mean(axis=0); sd = mac_tr.std(axis=0) + 1e-12
+        mac_all = torch.from_numpy(
+            (np.concatenate([mac_tr, mac_va, mac_te]) - mu) / sd).float()
+        X_all = np.concatenate([X_tr, X_va, X_te], axis=0)
+        R_all = np.concatenate([R_tr, R_va, R_te], axis=0)
+        R_all_t, X_all_t, mask_all_t = make_tensors(R_all, X_all, core_pos)
+        omega_te = None
+        with torch.no_grad():
+            z_all = znet(mac_all)
+            if args.arch == "cpz":
+                omega_all = sdfnet(z_all, X_all_t)
+                M_all = common_sdf(omega_all, R_all_t, mask_all_t)
+                omega_te = omega_all[-len(w_te):].numpy()
+                M_all = M_all.numpy()
+            else:
+                M_all = sdf_values(sdfnet(z_all), X_all_t).numpy()
+        M_te = M_all[-len(w_te):]
+        mask_te = np.isfinite(R_te) & np.isfinite(X_te[:, :, core_pos]).all(axis=2)
+        mask_te_t = torch.from_numpy(mask_te)
+        R_te_t = torch.from_numpy(np.nan_to_num(R_te, nan=0.0)).float()
+        if args.arch == "cpz":
+            rp = sdf_portfolio_return(
+                torch.from_numpy(omega_te).float(), R_te_t, mask_te_t).numpy()
+            alpha_te = pricing_errors_common(
+                torch.from_numpy(M_te).float(), R_te_t, mask_te_t).numpy()
+            alphas = [a for a in alpha_te if not np.isnan(a)]
+            if args.dump_mechanism:
+                tr_turn_kept = np.nanmean(turnover_full[w_tr][:, keep], axis=0)
+                dump_dir = RES / os.environ.get("DLAP_DUMP_DIR", "mechanism_dump")
+                dump_dir.mkdir(exist_ok=True, parents=True)
+                np.savez(
+                    dump_dir / f"window_{wi:02d}.npz",
+                    tickers=np.array([tickers_all[j] for j in np.where(keep)[0]],
+                                     dtype=object),
+                    omega_te=omega_te,           # (12, N_kept) SDF weights, OOS months
+                    alpha_te=alpha_te,           # (N_kept,) per-stock pricing error M*R
+                    R_te=R_te,                   # (12, N_kept) excess returns, OOS months
+                    months_te=np.array([common[i] for i in w_te]),
+                    keep=keep,
+                    tr_turn=tr_turn_kept,        # E8 rule: mean train-window turnover
+                    thr=np.nanpercentile(tr_turn_kept, 5))
+            if cnet is not None:
+                with torch.no_grad():
+                    m_te = cnet(torch.from_numpy(z_all.numpy()[-len(w_te):]).float(),
+                                torch.from_numpy(np.nan_to_num(X_te, nan=0.0)).float())
+                ak = critic_moment_alphas(torch.from_numpy(M_te).float(), m_te,
+                                          R_te_t, mask_te_t).numpy()
+                ak = ak[~np.isnan(ak)]
+                if ak.size >= 6:
+                    critic_alphas.append(float(np.sqrt(np.mean(ak ** 2))))
+        else:
+            num = np.where(mask_te, M_te * R_te, 0.0).sum(axis=1)
+            den = np.where(mask_te, M_te, 0.0).sum(axis=1)
+            rp = np.where(den != 0, num / np.where(den != 0, den, 1.0), np.nan)
+            rp = rp[np.isfinite(rp)]
+            alphas = [float((M_te[mask_te[:, i], i] * R_te[mask_te[:, i], i]).mean())
+                      for i in range(R_te.shape[1])
+                      if mask_te[:, i].sum() >= MIN_OBS_ALPHA]
+            if cnet is not None:
+                wc_te = cnet(torch.from_numpy(z_all.numpy()[-len(w_te):]).float()).numpy()
+                pr = (wc_te[:, None, :] * X_te).sum(axis=2) * R_te  # (12, N)
+                pr = np.where(mask_te, pr, 0.0)
+                n_ok = mask_te.sum()
+                if n_ok >= 6:
+                    critic_alphas.append(float(abs((M_te * pr).sum() / n_ok)))
+        if len(rp) >= 6:
+            pooled_rp.append(rp)
+            per_win_sharpe.append(sharpe_ann(rp))
+            all_alphas.extend(alphas)
+            done_windows.append(wi)
+            n_windows += 1
+            alpha_cells.extend((wi, a) for a in alphas)
+            # strict predictive OOS R2 (P6): frozen train betas/lambda applied
+            # to the test months (mirrors run_e1.eval_factor_model)
+            if oos_r2_inputs is not None:
+                betas_w, lam_w = oos_r2_inputs
+                ss_r, ss_t = 0.0, 0.0
+                for i, b in betas_w:
+                    ri = R_te[:, i]
+                    m = np.isfinite(ri)
+                    if m.sum() < 6:
+                        continue
+                    pred = b * lam_w
+                    ss_r += float(((ri[m] - pred) ** 2).sum())
+                    ss_t += float(((ri[m] - ri[m].mean()) ** 2).sum())
+                if ss_t > 0:
+                    oos_r2_num += ss_r
+                    oos_r2_den += ss_t
+
+    if not pooled_rp:
+        print("FATAL: no windows completed")
+        sys.exit(1)
+    rp_all = np.concatenate(pooled_rp)
+    sharpe = sharpe_ann(rp_all)
+    rms_alpha = float(np.sqrt(np.mean(np.square(all_alphas)))) * 100
+    max_alpha = float(np.max(np.abs(all_alphas))) * 100
+    critic_alpha_pct = float(np.mean(critic_alphas)) * 100 if critic_alphas else math.nan
+
+    # XS explained-variation (same construction as E1 EV)
+    ss_res = ss_tot = 0.0
+    n_ev = 0
+    for ev_j, wi in enumerate(done_windows):  # aligned with pooled_rp entries
+        w_tr, w_te = windows[wi]
+        keep = np.isfinite(R_exc[w_tr[:-12]]).sum(axis=0) >= 12
+        R_te_w = R_exc[w_te][:, keep]
+        rp_w = pooled_rp[ev_j]
+        for i in range(R_te_w.shape[1]):
+            ri = R_te_w[:, i]
+            m = np.isfinite(ri) & np.isfinite(rp_w)
+            if m.sum() < 8 or np.var(rp_w[m]) < 1e-12:
+                continue
+            b = np.polyfit(rp_w[m], ri[m], 1)
+            e = ri[m] - (b[0] * rp_w[m] + b[1])
+            ss_res += float((e ** 2).sum())
+            ss_tot += float(((ri[m] - ri[m].mean()) ** 2).sum())
+            n_ev += 1
+    ev = (1.0 - ss_res / ss_tot) if ss_tot > 0 else math.nan
+    print(f"\n{out_name.upper()} [{args.arch}] pooled OOS: n_windows={n_windows} "
+          f"sharpe={sharpe:.3f} EV={ev:.4f} rms_alpha={rms_alpha:.3f}% "
+          f"max_alpha={max_alpha:.3f}%"
+          + (f" critic_alpha={critic_alpha_pct:.3f}%" if args.critic else ""))
+
+    # ── save ───────────────────────────────────────────────────────────
+    out_csv = out_dir / f"{out_name}_results.csv"
+    with open(out_csv, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        for k, v in [("model", out_name.upper()), ("arch", args.arch),
+                     ("charset", args.charset),
+                     ("states", args.states), ("critic", args.critic),
+                     ("n_features", n_features),
+                     ("n_windows", n_windows), ("n_oos_months", len(rp_all)),
+                     ("sharpe_pooled", f"{sharpe:.4f}"),
+                     ("sharpe_mean_win", f"{float(np.mean(per_win_sharpe)):.4f}"),
+                     ("ev", f"{ev:.4f}"),
+                     ("oos_r2", f"{(1.0 - oos_r2_num / oos_r2_den):.4f}"
+                      if oos_r2_den > 0 else "nan"),
+                     ("rms_alpha_pct", f"{rms_alpha:.4f}"),
+                     ("max_alpha_pct", f"{max_alpha:.4f}"),
+                     ("critic_alpha_pct", f"{critic_alpha_pct:.4f}" if critic_alphas else "")]:
+            w.writerow([k, v])
+    with open(out_dir / f"{out_name}_pooled_series.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["oos_return"])
+        for v in rp_all:
+            w.writerow([f"{v:.6f}"])
+    with open(out_dir / f"{out_name}_alpha_cells.csv", "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["window", "alpha"])
+        for wi_c, a in alpha_cells:
+            w.writerow([wi_c, f"{a:.8f}"])
+
+    if sign_rows:
+        with open(out_dir / f"{out_name}_sign_symmetry.csv", "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["window", "L_plus", "L_minus", "rel_gap"])
+            for wi, lp, lm, gap in sign_rows:
+                w.writerow([wi, f"{lp:.8e}", f"{lm:.8e}", f"{gap:.6f}"])
+
+    # ── compare with E1 + prior runs ───────────────────────────────────
+    print("\n" + "=" * 88)
+    print(f"{'model':<11}{'Sharpe':>9}{'EV':>9}{'RMS_alpha%':>11}{'max_alpha%':>11}")
+    print("-" * 88)
+    print(f"{out_name.upper():<11}{sharpe:>9.3f}{ev:>9.4f}{rms_alpha:>11.3f}{max_alpha:>11.3f}")
+    for fname in ["e2_results.csv", "e3_results.csv", "e4a_results.csv",
+                  "e4b_results.csv", "e5a_results.csv", "e5b_results.csv"]:
+        p = RES / fname
+        if not p.exists() or p == out_csv:
+            continue
+        d = {r[0]: r[1] for r in csv.reader(open(p, encoding="utf-8-sig"))}
+        print(f"{d['model']:<11}{float(d['sharpe_pooled']):>9.3f}{float(d['ev']):>9.4f}"
+              f"{float(d['rms_alpha_pct']):>11.3f}{float(d['max_alpha_pct']):>11.3f}")
+    e1 = {}
+    if (RES / "e1_benchmarks.csv").exists():
+        for r in csv.DictReader(open(RES / "e1_benchmarks.csv", encoding="utf-8-sig")):
+            e1[r["name"]] = r
+        for m in ["Market", "FF5", "q-factor", "PCA(5)", "LASSO"]:
+            if m in e1:
+                r = e1[m]
+                print(f"{m:<11}{float(r['sharpe_pooled']):>9.3f}{float(r['ev']):>9.4f}"
+                      f"{float(r['rms_alpha_pct']):>11.3f}{float(r['max_alpha_pct']):>11.3f}")
+    print("=" * 88)
+    print(f"Saved -> {out_csv}")
+
+
+if __name__ == "__main__":
+    main()

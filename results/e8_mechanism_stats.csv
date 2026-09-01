@@ -1,0 +1,18 @@
+metric,tail,kept
+limit-hit freq (frac of days),0.2266,0.2025
+"Amihud (|ret|/value, x1e+09)",12.2457,5.3858
+median trades/day,299.8,379.3
+trading days/month,17.03,18.19
+frac months <=3 trading days,0.0414,0.0097
+monthly ret vol,0.1916,0.1968
+AR(1) monthly rets,0.114,0.085
+max monthly ret,1.0443,0.9504
+|omega| share on group,0.0534,
+positive-omega share on group,0.0419,
+share of count-weighted alpha^2 loss,4.61,
+RMS alpha of group (%),5.116,
+RMS alpha of group (%),,5.561
+EW portfolio Sharpe (ann.),0.057,
+EW portfolio Sharpe (ann.),,0.304
+EW portfolio monthly vol (%),8.401,
+EW portfolio monthly vol (%),,8.857

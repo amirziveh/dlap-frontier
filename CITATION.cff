@@ -1,0 +1,13 @@
+cff-version: 1.2.0
+message: "If you use this replication package, please cite it as below."
+title: "dlap-frontier: Replication package for 'Does Deep-Learning Asset Pricing Transfer to Frontier Markets?'"
+authors:
+  - family-names: Ziveh
+    given-names: Amir
+    affiliation: "Sharif University of Technology"
+  - family-names: Ghorbanali
+    given-names: Omid
+    affiliation: "Sharif University of Technology"
+version: v4.4
+date-released: "2026-09-01"
+license: MIT
