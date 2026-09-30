@@ -1,7 +1,10 @@
 # dlap-frontier
 
-Replication package for **"Does Deep-Learning Asset Pricing Transfer to Frontier
-Markets? A Deep Stochastic Discount Factor for Iran, Türkiye, and Pakistan."**
+Replication package for **"Does a Deep-Learning Stochastic Discount Factor
+Generalize Across Smaller Equity Markets? Evidence from Iran, Türkiye, and
+Pakistan."**
+
+**Archived at Zenodo:** [10.5281/zenodo.23068343](https://doi.org/10.5281/zenodo.23068343)
 
 The paper estimates the deep-learning stochastic discount factor (SDF) of
 Chen, Pelger & Zhu (2024) — a *common* kernel

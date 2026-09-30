@@ -1,15 +1,17 @@
 cff-version: 1.2.0
 message: "If you use this replication package, please cite it as below."
-title: "Replication package: Does Deep-Learning Asset Pricing Transfer Across Smaller Emerging and Frontier-Market Settings? Evidence from Iran, Türkiye, and Pakistan"
+title: "Replication package: Does a Deep-Learning Stochastic Discount Factor Generalize Across Smaller Equity Markets? Evidence from Iran, Türkiye, and Pakistan"
 authors:
   - family-names: Ziveh
     given-names: Amir
+    orcid: "https://orcid.org/0009-0008-0188-4668"
     affiliation: "Sharif University of Technology"
   - family-names: Ghorbanali
     given-names: Sajjad
+    orcid: "https://orcid.org/0009-0009-6743-0893"
     affiliation: "Sharif University of Technology"
 version: v4.8
-date-released: "2026-09-01"
+date-released: "2026-09-30"
 license: MIT
-doi: 10.5281/zenodo.22233050
+doi: 10.5281/zenodo.23068343
 url: "https://github.com/amirziveh/dlap-frontier"
